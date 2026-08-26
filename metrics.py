@@ -3,7 +3,8 @@
 
 指標一覧(project_store.EdgeMetrics に対応):
     - orb_homography_iou     : ORB特徴点+Homography推定によるIoU(粗いスクリーニング用)
-    - sp_lg_fmat_hull_area   : SuperPoint+LightGlue+F行列+凸包面積(精密判定用) ※要移植
+    - sp_lg_fmat_hull_area   : SuperPoint+LightGlue+F行列+凸包面積(精密判定用)
+                               (extract_keyframes_v2.py からロジック移植済み)
     - inlier_count / ratio   : マッチの信頼性
     - translation_vector     : E行列分解による並進方向(スケール不定)
     - parallax_angle_deg     : 視差角。EXIF概算Kが無ければNone(相対比較専用)
@@ -25,6 +26,80 @@ from typing import Optional
 
 import cv2
 import numpy as np
+
+# SuperPoint+LightGlueはオプション依存(torch+lightglue)。
+# 未インストールでもORB系の指標だけは使えるよう、importはここでは失敗させない。
+try:
+    import torch
+    from lightglue import LightGlue, SuperPoint
+    from lightglue.utils import rbd
+    _HAS_LIGHTGLUE = True
+except ImportError:
+    _HAS_LIGHTGLUE = False
+
+
+# ---------------------------------------------------------------------------
+# SuperPoint+LightGlue 推定器 (extract_keyframes_v2.py の OverlapEstimator を移植)
+# ---------------------------------------------------------------------------
+
+class _SuperPointLightGlueEstimator:
+    """extract_keyframes_v2.py の OverlapEstimator 相当。
+
+    extract/matchをキーフレーム単位で使い回す元スクリプトと異なり、
+    このツールでは任意のprev/currentペアを都度指定されるため、
+    extract_pair() で2枚まとめて特徴抽出+マッチングまで行うインターフェースにしている。
+    """
+
+    def __init__(self, device: Optional[str] = None, max_keypoints: int = 1024):
+        if not _HAS_LIGHTGLUE:
+            raise ImportError(
+                "SuperPoint+LightGlueには torch と lightglue が必要です。"
+                "pip install torch torchvision --break-system-packages\n"
+                "pip install git+https://github.com/cvg/LightGlue.git --break-system-packages"
+            )
+        self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
+        self.extractor = SuperPoint(max_num_keypoints=max_keypoints).eval().to(self.device)
+        self.matcher = LightGlue(features="superpoint").eval().to(self.device)
+
+    def _extract(self, gray_uint8: np.ndarray):
+        with torch.no_grad():
+            t = torch.from_numpy(gray_uint8).float().to(self.device) / 255.0
+            t = t.unsqueeze(0)  # (1,H,W)
+            return self.extractor.extract(t)
+
+    def match_pair(self, gray1: np.ndarray, gray2: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+        with torch.no_grad():
+            feats0 = self._extract(gray1)
+            feats1 = self._extract(gray2)
+            matches01 = self.matcher({"image0": feats0, "image1": feats1})
+            feats0d, feats1d, matches01d = [rbd(x) for x in [feats0, feats1, matches01]]
+            matches = matches01d["matches"]
+            kpts0 = feats0d["keypoints"]
+            kpts1 = feats1d["keypoints"]
+            m_kpts0 = kpts0[matches[..., 0]].cpu().numpy()
+            m_kpts1 = kpts1[matches[..., 1]].cpu().numpy()
+            return m_kpts0, m_kpts1
+
+
+_estimator_singleton: Optional[_SuperPointLightGlueEstimator] = None
+
+
+def _get_estimator() -> _SuperPointLightGlueEstimator:
+    global _estimator_singleton
+    if _estimator_singleton is None:
+        _estimator_singleton = _SuperPointLightGlueEstimator()
+    return _estimator_singleton
+
+
+def _to_gray_resized(bgr: np.ndarray, resize_width: Optional[int]) -> tuple[np.ndarray, float]:
+    """extract_keyframes_v2.py の to_gray_resized を移植。scale(=resized/元)も返す。"""
+    gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY) if bgr.ndim == 3 else bgr
+    if resize_width is None:
+        return gray, 1.0
+    h, w = gray.shape
+    scale = resize_width / float(w)
+    gray = cv2.resize(gray, (resize_width, int(round(h * scale))))
+    return gray, scale
 
 
 # ---------------------------------------------------------------------------
@@ -70,16 +145,32 @@ def orb_match(img1: np.ndarray, img2: np.ndarray, max_features: int = 2000) -> F
     return FeatureMatchResult(pts1=pts1, pts2=pts2)
 
 
-def superpoint_lightglue_match(img1: np.ndarray, img2: np.ndarray) -> FeatureMatchResult:
-    """SuperPoint+LightGlueによる高精度マッチング。
+def superpoint_lightglue_match(
+    img1: np.ndarray, img2: np.ndarray, resize_width: Optional[int] = 640
+) -> FeatureMatchResult:
+    """SuperPoint+LightGlueによる高精度マッチング(extract_keyframes_v2.pyのロジックを移植)。
 
-    TODO: extract_keyframes_v2.py の SuperPoint+LightGlue+F行列推定ロジックを移植する。
-    移植時は最終的に FeatureMatchResult(pts1, pts2, inlier_mask) を返す形にすること。
+    元スクリプトと同様、内部処理は resize_width に縮小した画像で行う(速度優先)。
+    ただし本ツールでは他の指標(IoU/凸包面積/カバレッジ等)が元解像度の座標系を
+    前提にしているため、マッチング後の座標は元解像度へスケールし直して返す。
+
+    torch/lightglue未インストールの場合はImportErrorを送出する
+    (呼び出し側 compute_edge_metrics で use_superpoint_lightglue=False にすればORBで代用可能)。
     """
-    raise NotImplementedError(
-        "SuperPoint+LightGlueのマッチングは未実装です。"
-        "extract_keyframes_v2.py のロジックをここに移植してください。"
-    )
+    estimator = _get_estimator()
+
+    gray1, scale1 = _to_gray_resized(img1, resize_width)
+    gray2, scale2 = _to_gray_resized(img2, resize_width)
+
+    m_kpts0, m_kpts1 = estimator.match_pair(gray1, gray2)
+
+    if len(m_kpts0) == 0:
+        return FeatureMatchResult(pts1=np.zeros((0, 2)), pts2=np.zeros((0, 2)))
+
+    # 縮小画像上の座標 -> 元解像度の座標へスケールし直す
+    pts1 = m_kpts0 / scale1
+    pts2 = m_kpts1 / scale2
+    return FeatureMatchResult(pts1=pts1, pts2=pts2)
 
 
 # ---------------------------------------------------------------------------
@@ -87,14 +178,24 @@ def superpoint_lightglue_match(img1: np.ndarray, img2: np.ndarray) -> FeatureMat
 # ---------------------------------------------------------------------------
 
 def estimate_fmatrix_inliers(match: FeatureMatchResult) -> FeatureMatchResult:
-    """F行列をRANSACで推定し、inlier_maskを埋めて返す。"""
+    """F行列をRANSACで推定し、inlier_maskを埋めて返す。
+
+    extract_keyframes_v2.py での知見を反映し、USAC_MAGSACを優先的に使う
+    (マッチ点数が多い場合にFM_RANSACが内部で例外を出すことがあるOpenCVの既知の問題への対策)。
+    USAC_MAGSACが使えない/失敗する環境ではFM_RANSACにフォールバックする。
+    """
     if len(match.pts1) < 8:
         match.inlier_mask = np.zeros((len(match.pts1),), dtype=bool)
         return match
 
-    F, mask = cv2.findFundamentalMat(
-        match.pts1, match.pts2, method=cv2.FM_RANSAC, ransacReprojThreshold=1.0, confidence=0.99
-    )
+    try:
+        F, mask = cv2.findFundamentalMat(
+            match.pts1, match.pts2, cv2.USAC_MAGSAC, ransacReprojThreshold=1.5, confidence=0.999
+        )
+    except cv2.error:
+        F, mask = cv2.findFundamentalMat(
+            match.pts1, match.pts2, method=cv2.FM_RANSAC, ransacReprojThreshold=1.0, confidence=0.99
+        )
     if mask is None:
         match.inlier_mask = np.zeros((len(match.pts1),), dtype=bool)
     else:

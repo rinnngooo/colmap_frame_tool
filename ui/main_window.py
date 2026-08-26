@@ -13,6 +13,11 @@
     3. グラフ(詳細ビュー)をクリックしてcurrentフレームを選択 -> 画像比較表示更新
     4. 「画像追加」: prevとcurrentの間の動画フレームを追加、影響エッジのみ再計算
     5. 「画像削除」: current画像を削除、影響エッジのみ再計算
+
+キーボード操作:
+    ← / →   : 選択中フレームを1つ前/次のフレームへ移動
+    Insert  : 画像を追加(prev-current間)
+    Delete  : 現在の画像を削除
 """
 
 from __future__ import annotations
@@ -27,6 +32,7 @@ from PyQt6.QtWidgets import (
     QFileDialog, QInputDialog, QMessageBox, QSplitter, QProgressDialog,
 )
 from PyQt6.QtCore import Qt
+from PyQt6.QtGui import QKeySequence, QShortcut
 
 from project_store import ProjectStore, FrameRecord
 from video_io import VideoReader
@@ -45,8 +51,49 @@ class MainWindow(QMainWindow):
         self.reader: Optional[VideoReader] = None
         self.project_dir: Optional[Path] = None
         self.current_filename: Optional[str] = None
+        self.use_sp_lg: bool = True   # SuperPoint+LightGlueを使う(未インストール等ならORBへ自動フォールバック)
+        self._sp_lg_fallback_warned: bool = False
 
         self._build_ui()
+        self._setup_shortcuts()
+
+    # -----------------------------------------------------------------
+    # キーボード操作
+    # -----------------------------------------------------------------
+
+    def _setup_shortcuts(self):
+        """← / → で選択フレーム移動、Insertで追加、Deleteで削除。
+
+        QShortcutはウィンドウ内でフォーカスされているウィジェットに関わらず
+        (WindowShortcutコンテキスト、デフォルト)反応する。
+        """
+        self.shortcut_prev = QShortcut(QKeySequence(Qt.Key.Key_Left), self)
+        self.shortcut_prev.activated.connect(self.select_prev_frame)
+
+        self.shortcut_next = QShortcut(QKeySequence(Qt.Key.Key_Right), self)
+        self.shortcut_next.activated.connect(self.select_next_frame)
+
+        self.shortcut_insert = QShortcut(QKeySequence(Qt.Key.Key_Insert), self)
+        self.shortcut_insert.activated.connect(self.add_frame_between)
+
+        self.shortcut_delete = QShortcut(QKeySequence(Qt.Key.Key_Delete), self)
+        self.shortcut_delete.activated.connect(self.remove_current_frame)
+
+    def select_prev_frame(self):
+        if self.store is None or self.current_filename is None or not self.store.frames:
+            return
+        idx = next(i for i, f in enumerate(self.store.frames) if f.filename == self.current_filename)
+        if idx > 0:
+            self.current_filename = self.store.frames[idx - 1].filename
+            self._refresh_image_compare()
+
+    def select_next_frame(self):
+        if self.store is None or self.current_filename is None or not self.store.frames:
+            return
+        idx = next(i for i, f in enumerate(self.store.frames) if f.filename == self.current_filename)
+        if idx < len(self.store.frames) - 1:
+            self.current_filename = self.store.frames[idx + 1].filename
+            self._refresh_image_compare()
 
     # -----------------------------------------------------------------
     # UI構築
@@ -64,14 +111,16 @@ class MainWindow(QMainWindow):
         self.btn_add = QPushButton("画像を追加(prev-current間)")
         self.btn_remove = QPushButton("現在の画像を削除")
         self.btn_save = QPushButton("プロジェクト保存")
+        self.btn_load = QPushButton("プロジェクトを開く")
 
         self.btn_open_video.clicked.connect(self.open_video)
         self.btn_extract.clicked.connect(self.extract_frames)
         self.btn_add.clicked.connect(self.add_frame_between)
         self.btn_remove.clicked.connect(self.remove_current_frame)
         self.btn_save.clicked.connect(self.save_project)
+        self.btn_load.clicked.connect(self.load_project)
 
-        for b in (self.btn_open_video, self.btn_extract, self.btn_add, self.btn_remove, self.btn_save):
+        for b in (self.btn_open_video, self.btn_extract, self.btn_add, self.btn_remove, self.btn_save, self.btn_load):
             button_row.addWidget(b)
         root_layout.addLayout(button_row)
 
@@ -189,11 +238,30 @@ class MainWindow(QMainWindow):
         for i, edge in enumerate(edges):
             prev_img = self._load_frame_image(edge.from_filename)
             curr_img = self._load_frame_image(edge.to_filename)
-            values = metrics_mod.compute_edge_metrics(prev_img, curr_img, K=None, use_superpoint_lightglue=False)
+            values = self._compute_edge_metrics_with_fallback(prev_img, curr_img)
             for k, v in values.items():
                 setattr(edge, k, v)
             progress.setValue(i + 1)
         progress.close()
+
+    def _compute_edge_metrics_with_fallback(self, prev_img, curr_img) -> dict:
+        """SuperPoint+LightGlueが使えればそれを使い、未インストール等で失敗する場合は
+        ORBに自動フォールバックする(初回のみユーザーに通知)。
+        """
+        if self.use_sp_lg:
+            try:
+                return metrics_mod.compute_edge_metrics(
+                    prev_img, curr_img, K=None, use_superpoint_lightglue=True
+                )
+            except ImportError as e:
+                self.use_sp_lg = False
+                if not self._sp_lg_fallback_warned:
+                    self._sp_lg_fallback_warned = True
+                    QMessageBox.warning(
+                        self, "SuperPoint+LightGlue利用不可",
+                        f"SuperPoint+LightGlueが使用できないため、以後ORBで計算します。\n詳細: {e}",
+                    )
+        return metrics_mod.compute_edge_metrics(prev_img, curr_img, K=None, use_superpoint_lightglue=False)
 
     # -----------------------------------------------------------------
     # グラフ / 画像比較の表示更新
@@ -314,3 +382,52 @@ class MainWindow(QMainWindow):
             return
         self.store.save(self.project_dir / "project.json")
         QMessageBox.information(self, "保存完了", f"{self.project_dir / 'project.json'} に保存しました")
+
+    def load_project(self):
+        path, _ = QFileDialog.getOpenFileName(self, "プロジェクトファイルを選択", "", "Project JSON (project.json);;JSON Files (*.json)")
+        if not path:
+            return
+
+        try:
+            self.store = ProjectStore.load(path)
+        except Exception as e:
+            QMessageBox.critical(self, "エラー", f"プロジェクトを読み込めませんでした: {e}")
+            return
+
+        self.project_dir = Path(path).parent
+        images_dir = self.project_dir / self.store.images_dir
+        if not images_dir.exists():
+            QMessageBox.warning(
+                self, "警告",
+                f"画像フォルダが見つかりません: {images_dir}\n"
+                "プロジェクトファイルと images フォルダは同じ場所に置いてください。",
+            )
+
+        # 動画の再オープンを試みる(画像追加にはシークが必要なため)。
+        # 動画が見つからない/開けない場合でも、既存画像の閲覧・削除は可能にする。
+        self.reader = None
+        video_loaded = False
+        try:
+            self.reader = VideoReader(self.store.video_path)
+            self.video_path = self.store.video_path
+            video_loaded = True
+        except Exception as e:
+            QMessageBox.warning(
+                self, "動画が見つかりません",
+                f"元動画を開けませんでした(画像の追加はできません): {e}\n"
+                f"video_path: {self.store.video_path}",
+            )
+
+        self.status_label.setText(
+            f"プロジェクト読み込み完了: {path} (frames={len(self.store.frames)}, "
+            f"動画{'あり' if video_loaded else 'なし'})"
+        )
+        self._set_actions_enabled(video_loaded=video_loaded, project_loaded=True)
+        # 既存プロジェクトを開いた後の「fps指定で抽出」は、frames/edgesを丸ごと
+        # 上書きしてしまい手動追加/削除の結果が失われるため、常に無効化しておく。
+        self.btn_extract.setEnabled(False)
+
+        if self.store.frames:
+            self.current_filename = self.store.frames[0].filename
+        self._refresh_graph()
+        self._refresh_image_compare()
