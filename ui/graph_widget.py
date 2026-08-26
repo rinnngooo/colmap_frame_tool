@@ -78,10 +78,12 @@ class GraphWidget(QWidget):
         self.detail_plot.setLabel("bottom", "時刻 (mm:ss)")
         self.detail_plot.addLegend(offset=(10, 10))
         self.detail_plot.scene().sigMouseClicked.connect(self._on_detail_click)
+        self.detail_plot.setMouseEnabled(x=True, y=False)  # y軸方向のマウス操作(パン/ズーム)を無効化
 
         self.overview_plot = pg.PlotWidget(axisItems={"bottom": TimeAxisItem(orientation="bottom")})
         self.overview_plot.setMaximumHeight(120)
         self.overview_plot.setLabel("bottom", "時刻 (mm:ss、全体)")
+        self.overview_plot.setMouseEnabled(x=True, y=False)
 
         self.region = pg.LinearRegionItem(brush=pg.mkBrush(100, 100, 255, 60))
         self.overview_plot.addItem(self.region)

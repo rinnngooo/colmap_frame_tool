@@ -134,12 +134,34 @@ class MainWindow(QMainWindow):
 
         splitter.addWidget(self.image_compare)
         splitter.addWidget(self.graph_widget)
-        splitter.setStretchFactor(0, 1)
+        # 上(画像比較):下(グラフ) = 75:25
+        splitter.setStretchFactor(0, 3)
         splitter.setStretchFactor(1, 1)
+        self.splitter = splitter
+        self._splitter_sized = False
 
         root_layout.addWidget(splitter, stretch=1)
 
         self._set_actions_enabled(video_loaded=False, project_loaded=False)
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        # 最大化状態での実際の高さが確定してから初回のみ75:25でサイズを設定する
+        # (setStretchFactorはリサイズ時の配分にしか効かないため、初期表示には明示的なsetSizesが必要)
+        if not self._splitter_sized:
+            total = self.splitter.height()
+            if total > 0:
+                self._splitter_sized = True
+                self.splitter.setSizes([int(total * 0.75), int(total * 0.25)])
+
+    def closeEvent(self, event):
+        """終了時に自動的にプロジェクトを保存する。"""
+        if self.store is not None and self.project_dir is not None:
+            try:
+                self.store.save(self.project_dir / "project.json")
+            except Exception as e:
+                QMessageBox.warning(self, "自動保存に失敗しました", str(e))
+        event.accept()
 
     def _set_actions_enabled(self, video_loaded: bool, project_loaded: bool):
         self.btn_extract.setEnabled(video_loaded)
@@ -297,11 +319,15 @@ class MainWindow(QMainWindow):
         curr = self.store.frames[idx]
         images_dir = self.project_dir / self.store.images_dir
 
-        self.image_compare.set_current(str(images_dir / curr.filename), self._mmss(curr.timestamp_ms))
+        self.image_compare.set_current(
+            str(images_dir / curr.filename), self._mmss(curr.timestamp_ms), curr.filename
+        )
 
         if idx > 0:
             prev = self.store.frames[idx - 1]
-            self.image_compare.set_prev(str(images_dir / prev.filename), self._mmss(prev.timestamp_ms))
+            self.image_compare.set_prev(
+                str(images_dir / prev.filename), self._mmss(prev.timestamp_ms), prev.filename
+            )
         else:
             self.image_compare.set_prev(None)
 

@@ -17,7 +17,13 @@ class _ImagePane(QWidget):
         self.title_label = QLabel(title)
         self.title_label.setStyleSheet("font-weight: bold;")
 
+        info_row = QHBoxLayout()
         self.timestamp_label = QLabel("--:--")
+        self.filename_label = QLabel("")
+        self.filename_label.setStyleSheet("color: gray;")
+        info_row.addWidget(self.timestamp_label)
+        info_row.addWidget(self.filename_label)
+        info_row.addStretch(1)
 
         self.image_label = QLabel()
         self.image_label.setMinimumSize(320, 240)
@@ -25,11 +31,12 @@ class _ImagePane(QWidget):
         self.image_label.setStyleSheet("background-color: #222;")
 
         layout.addWidget(self.title_label)
-        layout.addWidget(self.timestamp_label)
+        layout.addLayout(info_row)
         layout.addWidget(self.image_label, stretch=1)
 
-    def set_image(self, image_path: str | None, timestamp_label: str = "--:--"):
+    def set_image(self, image_path: str | None, timestamp_label: str = "--:--", filename: str = ""):
         self.timestamp_label.setText(timestamp_label)
+        self.filename_label.setText(filename)
         if image_path is None:
             self.image_label.setText("(画像なし)")
             self.image_label.setPixmap(QPixmap())
@@ -59,8 +66,8 @@ class ImageCompareWidget(QWidget):
         layout.addWidget(self.prev_pane)
         layout.addWidget(self.current_pane)
 
-    def set_prev(self, image_path: str | None, timestamp_label: str = "--:--"):
-        self.prev_pane.set_image(image_path, timestamp_label)
+    def set_prev(self, image_path: str | None, timestamp_label: str = "--:--", filename: str = ""):
+        self.prev_pane.set_image(image_path, timestamp_label, filename)
 
-    def set_current(self, image_path: str | None, timestamp_label: str = "--:--"):
-        self.current_pane.set_image(image_path, timestamp_label)
+    def set_current(self, image_path: str | None, timestamp_label: str = "--:--", filename: str = ""):
+        self.current_pane.set_image(image_path, timestamp_label, filename)

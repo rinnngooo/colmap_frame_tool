@@ -2,7 +2,13 @@
 プロジェクトのメタデータ(JSON)を管理するモジュール。
 
 命名規則:
-    frame_f{frame_index:07d}_t{timestamp_ms:08d}.png
+    t{総秒数:09.3f}s_{分:02d}.{秒:02d}.{ミリ秒:03d}s_f{frame_index:07d}.png
+    例: t00496.005s_08.16.005s_f0014867.png
+        (496.005秒 = 8分16.005秒地点、元動画の14867フレーム目)
+
+    先頭が総秒数(固定幅ゼロ埋め)のため、文字列ソート=時系列ソートが保たれる。
+    末尾のframe_indexはソートには影響しないが、元動画のどのフレームかを
+    ファイル名だけから復元できるように保持している。
 
 データモデル:
     FrameRecord - 1枚の抽出/追加画像に対応する情報
@@ -28,11 +34,11 @@ from pathlib import Path
 from typing import Optional
 
 
-FILENAME_TEMPLATE = "frame_f{frame_index:07d}_t{timestamp_ms:08d}.png"
-
-
 def make_filename(frame_index: int, timestamp_ms: int) -> str:
-    return FILENAME_TEMPLATE.format(frame_index=frame_index, timestamp_ms=timestamp_ms)
+    total_seconds = timestamp_ms / 1000.0
+    minutes, rem_ms = divmod(timestamp_ms, 60000)
+    seconds, ms = divmod(rem_ms, 1000)
+    return f"t{total_seconds:09.3f}s_{minutes:02d}.{seconds:02d}.{ms:03d}s_f{frame_index:07d}.png"
 
 
 @dataclass
