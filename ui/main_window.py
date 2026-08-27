@@ -31,7 +31,7 @@ from PyQt6.QtWidgets import (
     QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QPushButton, QLabel,
     QFileDialog, QInputDialog, QMessageBox, QSplitter, QProgressDialog,
 )
-from PyQt6.QtCore import Qt
+from PyQt6.QtCore import Qt, QThread
 from PyQt6.QtGui import QKeySequence, QShortcut
 
 from project_store import ProjectStore, FrameRecord
@@ -39,6 +39,7 @@ from video_io import VideoReader
 import metrics as metrics_mod
 from ui.graph_widget import GraphWidget
 from ui.image_compare_widget import ImageCompareWidget
+from ui.edge_compute_worker import EdgeComputeWorker, WarmupWorker
 
 
 class MainWindow(QMainWindow):
@@ -53,6 +54,16 @@ class MainWindow(QMainWindow):
         self.current_filename: Optional[str] = None
         self.use_sp_lg: bool = True   # SuperPoint+LightGlueを使う(未インストール等ならORBへ自動フォールバック)
         self._sp_lg_fallback_warned: bool = False
+
+        # バックグラウンド計算(エッジ指標計算・モデル事前ロード)の状態管理
+        self._busy: bool = False
+        self._video_loaded: bool = False
+        self._project_loaded: bool = False
+        self._extract_locked: bool = False  # 既存プロジェクト読み込み後は再抽出を禁止
+        self._compute_thread: Optional[QThread] = None
+        self._compute_worker: Optional[EdgeComputeWorker] = None
+        self._warmup_thread: Optional[QThread] = None
+        self._warmup_worker: Optional[WarmupWorker] = None
 
         self._build_ui()
         self._setup_shortcuts()
@@ -155,7 +166,17 @@ class MainWindow(QMainWindow):
                 self.splitter.setSizes([int(total * 0.75), int(total * 0.25)])
 
     def closeEvent(self, event):
-        """終了時に自動的にプロジェクトを保存する。"""
+        """終了時に自動的にプロジェクトを保存する。
+
+        バックグラウンド計算スレッドが実行中の場合、突然破棄すると不正終了する
+        恐れがあるため、短時間だけ完了を待つ(待ちきれない場合はそのまま終了)。
+        """
+        if self._compute_thread is not None and self._compute_thread.isRunning():
+            self._compute_thread.quit()
+            self._compute_thread.wait(3000)
+        if self._warmup_thread is not None and self._warmup_thread.isRunning():
+            self._warmup_thread.wait(3000)
+
         if self.store is not None and self.project_dir is not None:
             try:
                 self.store.save(self.project_dir / "project.json")
@@ -164,10 +185,24 @@ class MainWindow(QMainWindow):
         event.accept()
 
     def _set_actions_enabled(self, video_loaded: bool, project_loaded: bool):
-        self.btn_extract.setEnabled(video_loaded)
-        self.btn_add.setEnabled(project_loaded)
-        self.btn_remove.setEnabled(project_loaded)
-        self.btn_save.setEnabled(project_loaded)
+        self._video_loaded = video_loaded
+        self._project_loaded = project_loaded
+        self._apply_enabled_state()
+
+    def _apply_enabled_state(self):
+        enabled = not self._busy
+        self.btn_open_video.setEnabled(enabled)
+        self.btn_load.setEnabled(enabled)
+        self.btn_extract.setEnabled(enabled and self._video_loaded and not self._extract_locked)
+        self.btn_add.setEnabled(enabled and self._project_loaded and self.reader is not None)
+        self.btn_remove.setEnabled(enabled and self._project_loaded)
+        self.btn_save.setEnabled(enabled and self._project_loaded)
+
+    def _set_busy(self, busy: bool, message: Optional[str] = None):
+        self._busy = busy
+        self._apply_enabled_state()
+        if message is not None:
+            self.status_label.setText(message)
 
     # -----------------------------------------------------------------
     # 動画を開く / 抽出
@@ -184,10 +219,37 @@ class MainWindow(QMainWindow):
             return
 
         self.video_path = path
+        self._extract_locked = False
         self.status_label.setText(
             f"動画読み込み完了: {Path(path).name} (fps={self.reader.fps:.2f}, frames={self.reader.frame_count})"
         )
         self._set_actions_enabled(video_loaded=True, project_loaded=False)
+        self._start_warmup()
+
+    def _start_warmup(self):
+        """SuperPoint+LightGlueモデルをバックグラウンドで事前ロードする。
+
+        Add/Delete操作の初回実行時に遅延初期化コストがかかりフリーズしたように
+        見えるのを防ぐため、動画を開いたタイミングで先にロードを済ませておく。
+        """
+        if not metrics_mod._HAS_LIGHTGLUE or self._warmup_thread is not None:
+            return
+
+        self._warmup_thread = QThread(self)
+        self._warmup_worker = WarmupWorker()
+        self._warmup_worker.moveToThread(self._warmup_thread)
+        self._warmup_thread.started.connect(self._warmup_worker.run)
+        self._warmup_worker.finished.connect(self._on_warmup_finished)
+        self._warmup_worker.finished.connect(self._warmup_thread.quit)
+        self._warmup_worker.finished.connect(self._warmup_worker.deleteLater)
+        self._warmup_thread.finished.connect(self._warmup_thread.deleteLater)
+        self._warmup_thread.start()
+
+    def _on_warmup_finished(self, ok: bool):
+        self._warmup_thread = None
+        self._warmup_worker = None
+        if ok:
+            self.status_label.setText(self.status_label.text() + "  [SuperPoint+LightGlue準備完了]")
 
     def extract_frames(self):
         if self.reader is None:
@@ -212,12 +274,16 @@ class MainWindow(QMainWindow):
         )
 
         frame_records = []
-        samples = list(self.reader.extract_at_fps(fps))
+        total_samples = self.reader.estimate_extract_count(fps)
 
-        progress = QProgressDialog("フレーム抽出中...", "キャンセル", 0, len(samples), self)
+        progress = QProgressDialog("フレーム抽出中...", "キャンセル", 0, total_samples, self)
         progress.setWindowModality(Qt.WindowModality.WindowModal)
 
-        for i, sample in enumerate(samples):
+        # 重要: list(self.reader.extract_at_fps(fps)) のように全フレームを先に
+        # メモリへ展開しない。抽出対象フレーム数 x 1枚あたりのサイズ分だけ
+        # メモリを一気に消費してしまうため(例: 1920x1080で1800枚なら約11GB)、
+        # ジェネレータのまま1枚ずつ処理し、保存が終わったフレームはすぐに破棄する。
+        for i, sample in enumerate(self.reader.extract_at_fps(fps)):
             if progress.wasCanceled():
                 break
             record = FrameRecord.create(sample.frame_index, sample.timestamp_ms)
@@ -230,60 +296,87 @@ class MainWindow(QMainWindow):
         progress.close()
 
         affected_edges = self.store.initial_extract(frame_records)
-        self._recompute_edges(affected_edges, progress_title="エッジ指標を計算中...")
-
         self.status_label.setText(f"{len(frame_records)}枚を抽出しました ({fps} fps)")
         self._set_actions_enabled(video_loaded=True, project_loaded=True)
-        self._refresh_graph()
+        self._refresh_graph()  # まずフレーム単体の指標(ブレ等)だけ即座に表示
 
         if self.store.frames:
             self.current_filename = self.store.frames[-1].filename
             self._refresh_image_compare()
 
+        self._recompute_edges_async(affected_edges, progress_title="エッジ指標を計算中...")
+
     # -----------------------------------------------------------------
-    # エッジ指標の(再)計算
+    # エッジ指標の(再)計算 (バックグラウンドスレッドで実行し、GUIをブロックしない)
     # -----------------------------------------------------------------
 
-    def _load_frame_image(self, filename: str) -> np.ndarray:
-        path = self.project_dir / self.store.images_dir / filename
-        img = cv2.imread(str(path))
-        if img is None:
-            raise IOError(f"画像を読み込めませんでした: {path}")
-        return img
-
-    def _recompute_edges(self, edges, progress_title: str = "計算中..."):
-        if not edges:
-            return
-        progress = QProgressDialog(progress_title, None, 0, len(edges), self)
-        progress.setWindowModality(Qt.WindowModality.WindowModal)
-
-        for i, edge in enumerate(edges):
-            prev_img = self._load_frame_image(edge.from_filename)
-            curr_img = self._load_frame_image(edge.to_filename)
-            values = self._compute_edge_metrics_with_fallback(prev_img, curr_img)
-            for k, v in values.items():
-                setattr(edge, k, v)
-            progress.setValue(i + 1)
-        progress.close()
-
-    def _compute_edge_metrics_with_fallback(self, prev_img, curr_img) -> dict:
-        """SuperPoint+LightGlueが使えればそれを使い、未インストール等で失敗する場合は
-        ORBに自動フォールバックする(初回のみユーザーに通知)。
+    def _recompute_edges_async(self, edges, progress_title: str = "計算中...", on_done=None):
+        """SuperPoint+LightGlueを含む指標計算はGUIスレッドで行うとフリーズの原因になるため、
+        QThread上のEdgeComputeWorkerで実行する。結果はシグナル経由で受け取り、
+        メインスレッド側でProjectStoreに反映する。
         """
-        if self.use_sp_lg:
-            try:
-                return metrics_mod.compute_edge_metrics(
-                    prev_img, curr_img, K=None, use_superpoint_lightglue=True
-                )
-            except ImportError as e:
-                self.use_sp_lg = False
-                if not self._sp_lg_fallback_warned:
-                    self._sp_lg_fallback_warned = True
-                    QMessageBox.warning(
-                        self, "SuperPoint+LightGlue利用不可",
-                        f"SuperPoint+LightGlueが使用できないため、以後ORBで計算します。\n詳細: {e}",
-                    )
-        return metrics_mod.compute_edge_metrics(prev_img, curr_img, K=None, use_superpoint_lightglue=False)
+        if not edges:
+            if on_done:
+                on_done()
+            return
+        if self._busy:
+            # 通常はUI側(ボタン無効化/ショートカットガード)で防ぐが、念のための保険
+            QMessageBox.information(self, "情報", "計算中のため、完了までお待ちください")
+            return
+
+        images_dir = self.project_dir / self.store.images_dir
+        jobs = [
+            (e.from_filename, e.to_filename,
+             str(images_dir / e.from_filename), str(images_dir / e.to_filename))
+            for e in edges
+        ]
+
+        self._set_busy(True, message=f"{progress_title} (0/{len(jobs)})")
+
+        thread = QThread(self)
+        worker = EdgeComputeWorker(jobs, self.use_sp_lg)
+        worker.moveToThread(thread)
+
+        thread.started.connect(worker.run)
+        worker.edge_result.connect(self._on_edge_result)
+        worker.progress.connect(
+            lambda done, total, title=progress_title: self.status_label.setText(f"{title} ({done}/{total})")
+        )
+        worker.fallback_warning.connect(self._on_sp_lg_fallback)
+        worker.finished.connect(thread.quit)
+        worker.finished.connect(worker.deleteLater)
+        thread.finished.connect(thread.deleteLater)
+        thread.finished.connect(lambda: self._on_recompute_finished(on_done))
+
+        self._compute_thread = thread
+        self._compute_worker = worker
+        thread.start()
+
+    def _on_edge_result(self, from_filename: str, to_filename: str, values: dict):
+        if self.store is None:
+            return
+        edge = self.store.get_edge(from_filename, to_filename)
+        if edge is None:
+            return
+        for k, v in values.items():
+            setattr(edge, k, v)
+
+    def _on_sp_lg_fallback(self, message: str):
+        self.use_sp_lg = False
+        if not self._sp_lg_fallback_warned:
+            self._sp_lg_fallback_warned = True
+            QMessageBox.warning(
+                self, "SuperPoint+LightGlue利用不可",
+                f"SuperPoint+LightGlueが使用できないため、以後ORBで計算します。\n詳細: {message}",
+            )
+
+    def _on_recompute_finished(self, on_done):
+        self._compute_thread = None
+        self._compute_worker = None
+        self._set_busy(False)
+        self._refresh_graph()
+        if on_done:
+            on_done()
 
     # -----------------------------------------------------------------
     # グラフ / 画像比較の表示更新
@@ -352,6 +445,8 @@ class MainWindow(QMainWindow):
         self._refresh_image_compare()
 
     def add_frame_between(self):
+        if self._busy:
+            return
         if self.store is None or self.current_filename is None or self.reader is None:
             return
         idx = next(i for i, f in enumerate(self.store.frames) if f.filename == self.current_filename)
@@ -373,12 +468,16 @@ class MainWindow(QMainWindow):
         new_record.exposure_ratio = metrics_mod.exposure_ratio(sample.image)
         cv2.imwrite(str(images_dir / new_record.filename), sample.image)
 
-        self._recompute_edges(affected, progress_title="追加分の指標を再計算中...")
+        # 画像の切り替え自体は指標計算の完了を待たずに即座に反映する
         self.current_filename = new_record.filename
         self._refresh_graph()
         self._refresh_image_compare()
 
+        self._recompute_edges_async(affected, progress_title="追加分の指標を再計算中...")
+
     def remove_current_frame(self):
+        if self._busy:
+            return
         if self.store is None or self.current_filename is None:
             return
         removed_filename = self.current_filename
@@ -388,8 +487,6 @@ class MainWindow(QMainWindow):
         images_dir = self.project_dir / self.store.images_dir
         (images_dir / removed_filename).unlink(missing_ok=True)
 
-        self._recompute_edges(affected, progress_title="削除後の指標を再計算中...")
-
         if self.store.frames:
             next_idx = min(idx, len(self.store.frames) - 1)
             self.current_filename = self.store.frames[next_idx].filename
@@ -398,6 +495,8 @@ class MainWindow(QMainWindow):
 
         self._refresh_graph()
         self._refresh_image_compare()
+
+        self._recompute_edges_async(affected, progress_title="削除後の指標を再計算中...")
 
     # -----------------------------------------------------------------
     # プロジェクト保存
@@ -448,12 +547,15 @@ class MainWindow(QMainWindow):
             f"プロジェクト読み込み完了: {path} (frames={len(self.store.frames)}, "
             f"動画{'あり' if video_loaded else 'なし'})"
         )
-        self._set_actions_enabled(video_loaded=video_loaded, project_loaded=True)
         # 既存プロジェクトを開いた後の「fps指定で抽出」は、frames/edgesを丸ごと
         # 上書きしてしまい手動追加/削除の結果が失われるため、常に無効化しておく。
-        self.btn_extract.setEnabled(False)
+        self._extract_locked = True
+        self._set_actions_enabled(video_loaded=video_loaded, project_loaded=True)
 
         if self.store.frames:
             self.current_filename = self.store.frames[0].filename
         self._refresh_graph()
         self._refresh_image_compare()
+
+        if video_loaded:
+            self._start_warmup()

@@ -68,6 +68,22 @@ class VideoReader:
 
         return FrameSample(frame_index=frame_index, timestamp_ms=timestamp_ms, image=image)
 
+    def estimate_extract_count(self, target_fps: float) -> int:
+        """extract_at_fps(target_fps)が生成するフレーム数を、実際にフレームを
+        読み込まずに見積もる(進捗バーの範囲設定などに使う)。
+        """
+        if target_fps <= 0:
+            raise ValueError("target_fps は正の値である必要があります")
+        step = self.fps / target_fps
+        num_samples = int(self.frame_count / step) + 1
+        count = 0
+        for i in range(num_samples):
+            frame_index = int(round(i * step))
+            if frame_index >= self.frame_count:
+                break
+            count += 1
+        return count
+
     def extract_at_fps(self, target_fps: float) -> Iterator[FrameSample]:
         """指定fpsで等間隔にフレームを抽出する(元動画基準のframe_indexで返す)。"""
         if target_fps <= 0:

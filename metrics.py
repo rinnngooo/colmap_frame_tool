@@ -145,6 +145,20 @@ def orb_match(img1: np.ndarray, img2: np.ndarray, max_features: int = 2000) -> F
     return FeatureMatchResult(pts1=pts1, pts2=pts2)
 
 
+def warmup() -> bool:
+    """SuperPoint+LightGlueモデルを事前ロードしておく(遅延初期化コストを前倒しする用)。
+
+    UI側ではこれをバックグラウンドスレッドから呼び出し、動画を開いた直後などに
+    モデルロードを済ませておくことで、Add/Delete操作中に突然フリーズするのを防ぐ。
+
+    戻り値: 事前ロードできた場合True、torch/lightglue未インストールならFalse。
+    """
+    if not _HAS_LIGHTGLUE:
+        return False
+    _get_estimator()
+    return True
+
+
 def superpoint_lightglue_match(
     img1: np.ndarray, img2: np.ndarray, resize_width: Optional[int] = 640
 ) -> FeatureMatchResult:
