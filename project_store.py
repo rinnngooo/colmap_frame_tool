@@ -37,8 +37,12 @@ from typing import Optional
 def make_filename(frame_index: int, timestamp_ms: int) -> str:
     total_seconds = timestamp_ms / 1000.0
     minutes, rem_ms = divmod(timestamp_ms, 60000)
-    seconds, ms = divmod(rem_ms, 1000)
-    return f"t{total_seconds:09.3f}s_{minutes:02d}.{seconds:02d}.{ms:03d}s_f{frame_index:07d}.png"
+    seconds_rounded = round(rem_ms / 1000.0, 1)
+    if seconds_rounded >= 60.0:
+        # 四捨五入の結果ちょうど60.0秒になった場合は繰り上げる(例: 59.96s -> 60.0s -> 1分0.0秒)
+        seconds_rounded -= 60.0
+        minutes += 1
+    return f"t{minutes:02d}.{seconds_rounded:04.1f}s_t{total_seconds:09.3f}s_f{frame_index:07d}.png"
 
 
 @dataclass

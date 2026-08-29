@@ -27,6 +27,8 @@ from typing import Optional
 import cv2
 import numpy as np
 
+from mem_diag import DEBUG_MEMORY, current_rss_mb, release_unused_memory
+
 # SuperPoint+LightGlueはオプション依存(torch+lightglue)。
 # 未インストールでもORB系の指標だけは使えるよう、importはここでは失敗させない。
 try:
@@ -50,7 +52,7 @@ class _SuperPointLightGlueEstimator:
     extract_pair() で2枚まとめて特徴抽出+マッチングまで行うインターフェースにしている。
     """
 
-    def __init__(self, device: Optional[str] = None, max_keypoints: int = 1024):
+    def __init__(self, device: Optional[str] = None, max_keypoints: int = 512):
         if not _HAS_LIGHTGLUE:
             raise ImportError(
                 "SuperPoint+LightGlueには torch と lightglue が必要です。"
@@ -68,9 +70,18 @@ class _SuperPointLightGlueEstimator:
             return self.extractor.extract(t)
 
     def match_pair(self, gray1: np.ndarray, gray2: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+        # LightGlueの計算コスト(特にattention)はキーポイント数に対して非線形に増える。
+        # 実際に検出されるキーポイント数は画像の内容(テクスチャの多さ)次第でばらつくため、
+        # 「たまたまテクスチャが多く、両画像とも上限(max_num_keypoints)近くまで
+        # キーポイントが検出されたペア」だけ突出してメモリを消費することがある。
+        # DEBUG_MEMORY=1 で件数とRSSを記録し、この相関を確認できるようにしている。
+        rss_before = current_rss_mb() if DEBUG_MEMORY else None
+
         with torch.no_grad():
             feats0 = self._extract(gray1)
             feats1 = self._extract(gray2)
+            n_kpts0 = feats0["keypoints"].shape[1]
+            n_kpts1 = feats1["keypoints"].shape[1]
             matches01 = self.matcher({"image0": feats0, "image1": feats1})
             feats0d, feats1d, matches01d = [rbd(x) for x in [feats0, feats1, matches01]]
             matches = matches01d["matches"]
@@ -78,7 +89,20 @@ class _SuperPointLightGlueEstimator:
             kpts1 = feats1d["keypoints"]
             m_kpts0 = kpts0[matches[..., 0]].cpu().numpy()
             m_kpts1 = kpts1[matches[..., 1]].cpu().numpy()
-            return m_kpts0, m_kpts1
+
+        # 中間テンソルへの参照を明示的に切ってから解放を促す
+        del feats0, feats1, matches01, feats0d, feats1d, matches01d, matches, kpts0, kpts1
+        release_unused_memory()
+
+        if DEBUG_MEMORY:
+            rss_after = current_rss_mb()
+            print(
+                f"[metrics.DEBUG_MEMORY] n_kpts=({n_kpts0},{n_kpts1}) n_matches={len(m_kpts0)} "
+                f"RSS: {rss_before:.1f}MB -> {rss_after:.1f}MB (delta{rss_after - rss_before:+.1f}MB)",
+                flush=True,
+            )
+
+        return m_kpts0, m_kpts1
 
 
 _estimator_singleton: Optional[_SuperPointLightGlueEstimator] = None
@@ -333,6 +357,19 @@ def feature_coverage(match: FeatureMatchResult, img_shape: tuple[int, int], grid
         cx, cy = int(x // cell_w), int(y // cell_h)
         occupied.add((min(cx, grid - 1), min(cy, grid - 1)))
     return len(occupied) / (grid * grid)
+
+
+def orb_iou_and_coverage(img1: np.ndarray, img2: np.ndarray) -> tuple[Optional[float], Optional[float]]:
+    """「指標で抽出」機能で使う、ORBベースのIoUとFeature Coverageをまとめて計算する。
+
+    動画内の連続フレームを高速に大量評価する必要があるため、SuperPoint+LightGlueではなく
+    軽量なORBを使う。orb_homography_iou / feature_coverage 単体の指標定義と同じもの。
+    """
+    match = orb_match(img1, img2)
+    iou = homography_iou(match, img2.shape)
+    match = estimate_fmatrix_inliers(match)
+    coverage = feature_coverage(match, img2.shape)
+    return iou, coverage
 
 
 # ---------------------------------------------------------------------------

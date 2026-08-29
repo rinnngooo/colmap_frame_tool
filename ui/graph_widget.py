@@ -20,8 +20,9 @@ from typing import Optional
 
 import numpy as np
 import pyqtgraph as pg
-from PyQt6.QtCore import Qt, pyqtSignal
-from PyQt6.QtWidgets import QWidget, QVBoxLayout, QHBoxLayout, QCheckBox, QLabel, QGroupBox
+from PyQt6.QtCore import Qt, pyqtSignal, QRect
+from PyQt6.QtGui import QCursor
+from PyQt6.QtWidgets import QWidget, QVBoxLayout, QHBoxLayout, QCheckBox, QLabel, QGroupBox, QToolTip
 
 METRIC_LABELS = {
     "orb_homography_iou": "ORB Homography IoU",
@@ -78,6 +79,7 @@ class GraphWidget(QWidget):
         self.detail_plot.setLabel("bottom", "時刻 (mm:ss)")
         self.detail_plot.addLegend(offset=(10, 10))
         self.detail_plot.scene().sigMouseClicked.connect(self._on_detail_click)
+        self.detail_plot.scene().sigMouseMoved.connect(self._on_detail_hover)
         self.detail_plot.setMouseEnabled(x=True, y=False)  # y軸方向のマウス操作(パン/ズーム)を無効化
 
         self.overview_plot = pg.PlotWidget(axisItems={"bottom": TimeAxisItem(orientation="bottom")})
@@ -191,6 +193,54 @@ class GraphWidget(QWidget):
 
         if nearest_x is not None:
             self.frameSelected.emit(nearest_x)
+
+    def _on_detail_hover(self, scene_pos):
+        if not self._raw_series:
+            return
+        # プロット領域外にカーソルがある場合はツールチップを出さない
+        if not self.detail_plot.sceneBoundingRect().contains(scene_pos):
+            QToolTip.hideText()
+            return
+
+        vb = self.detail_plot.getPlotItem().vb
+        mouse_point = vb.mapSceneToView(scene_pos)
+        hover_x = mouse_point.x()
+
+        # カーソルに最も近いフレーム(時刻)を探す(表示中の系列に限らず、全系列のx軸から探す)
+        nearest_x = None
+        nearest_dist = float("inf")
+        for x_sec, _ in self._raw_series.values():
+            if x_sec.size == 0:
+                continue
+            idx = int(np.argmin(np.abs(x_sec - hover_x)))
+            dist = abs(x_sec[idx] - hover_x)
+            if dist < nearest_dist:
+                nearest_dist = dist
+                nearest_x = x_sec[idx]
+
+        if nearest_x is None:
+            QToolTip.hideText()
+            return
+
+        lines = [f"時刻: {ms_to_mmss(nearest_x * 1000)}"]
+        for name, (x_sec, y_raw) in self._raw_series.items():
+            if name not in self._checkboxes or not self._checkboxes[name].isChecked():
+                continue
+            if x_sec.size == 0:
+                continue
+            idx = int(np.argmin(np.abs(x_sec - nearest_x)))
+            if abs(x_sec[idx] - nearest_x) > 1e-6:
+                continue  # この系列にはその時刻のデータ点が無い
+            value = y_raw[idx]
+            label = METRIC_LABELS.get(name, name)
+            value_text = "-" if np.isnan(value) else f"{value:.4g}"
+            lines.append(f"{label}: {value_text}")
+
+        # msecShowTimeを明示指定しないと(デフォルト-1)、テキストの長さから自動算出される
+        # 表示時間が短くなり、すぐに消えてしまうことがある。マウスが動いている間は
+        # このハンドラが呼ばれるたびに再表示されるが、マウスが止まっている間も
+        # 消えないよう十分に長い時間(60秒)を指定する。
+        QToolTip.showText(QCursor.pos(), "\n".join(lines), self.detail_plot, QRect(), 60000)
 
     def highlight_selected(self, x_sec: float):
         """選択中フレームの位置に縦線を表示する。"""

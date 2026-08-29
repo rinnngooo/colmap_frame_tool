@@ -55,6 +55,8 @@ class EdgeComputeWorker(QObject):
 
             self.edge_result.emit(from_fn, to_fn, values)
             self.progress.emit(i + 1, total)
+            # 大きな画像配列への参照をループの次周まで持ち越さないようにする
+            del prev_img, curr_img, values
 
         self.finished.emit()
 

@@ -29,7 +29,7 @@ import cv2
 import numpy as np
 from PyQt6.QtWidgets import (
     QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QPushButton, QLabel,
-    QFileDialog, QInputDialog, QMessageBox, QSplitter, QProgressDialog,
+    QFileDialog, QMessageBox, QSplitter, QProgressDialog,
 )
 from PyQt6.QtCore import Qt, QThread
 from PyQt6.QtGui import QKeySequence, QShortcut
@@ -40,6 +40,13 @@ import metrics as metrics_mod
 from ui.graph_widget import GraphWidget
 from ui.image_compare_widget import ImageCompareWidget
 from ui.edge_compute_worker import EdgeComputeWorker, WarmupWorker
+from ui.extraction_dialog import ExtractionOptionsDialog
+
+# 「指標で抽出」実行時、各候補フレームのORB Homography IoU / Feature Coverageと
+# 判定結果をコンソールに出力する(デフォルトON)。不要な場合は環境変数で無効化できる:
+#   COLMAP_TOOL_DEBUG_EXTRACT=0 python3 main.py
+import os
+DEBUG_EXTRACT = os.environ.get("COLMAP_TOOL_DEBUG_EXTRACT", "1") == "1"
 
 
 class MainWindow(QMainWindow):
@@ -118,7 +125,7 @@ class MainWindow(QMainWindow):
         # ツールバー相当のボタン列
         button_row = QHBoxLayout()
         self.btn_open_video = QPushButton("動画を開く")
-        self.btn_extract = QPushButton("fps指定で抽出")
+        self.btn_extract = QPushButton("画像を抽出")
         self.btn_add = QPushButton("画像を追加(prev-current間)")
         self.btn_remove = QPushButton("現在の画像を削除")
         self.btn_save = QPushButton("プロジェクト保存")
@@ -255,9 +262,10 @@ class MainWindow(QMainWindow):
         if self.reader is None:
             return
 
-        fps, ok = QInputDialog.getDouble(self, "抽出fps", "抽出するfpsを入力してください", 2.0, 0.1, 60.0, 2)
-        if not ok:
+        dialog = ExtractionOptionsDialog(self)
+        if dialog.exec() != dialog.DialogCode.Accepted:
             return
+        options = dialog.get_result()
 
         out_dir = QFileDialog.getExistingDirectory(self, "プロジェクト出力先フォルダを選択")
         if not out_dir:
@@ -266,13 +274,51 @@ class MainWindow(QMainWindow):
         images_dir = self.project_dir / "images"
         images_dir.mkdir(parents=True, exist_ok=True)
 
-        self.store = ProjectStore(
-            video_path=self.video_path,
-            video_fps=self.reader.fps,
-            extract_fps=fps,
-            images_dir="images",
-        )
+        if options["mode"] == "fps":
+            fps = options["fps"]
+            self.store = ProjectStore(
+                video_path=self.video_path, video_fps=self.reader.fps,
+                extract_fps=fps, images_dir="images",
+            )
+            frame_records = self._extract_by_fps(images_dir, fps)
+            summary = f"{len(frame_records)}枚を抽出しました ({fps} fps)"
+        else:
+            self.store = ProjectStore(
+                video_path=self.video_path, video_fps=self.reader.fps,
+                extract_fps=0.0, images_dir="images",
+            )
+            frame_records = self._extract_by_metrics(
+                images_dir,
+                target_iou=options["target_iou"],
+                target_coverage=options["target_coverage"],
+                min_gap=options["min_gap"],
+                max_gap=options["max_gap"],
+            )
+            summary = (
+                f"{len(frame_records)}枚を抽出しました "
+                f"(指標: IoU>={options['target_iou']}, Coverage>={options['target_coverage']}, "
+                f"gap=[{options['min_gap']},{options['max_gap']}])"
+            )
 
+        affected_edges = self.store.initial_extract(frame_records)
+        self.status_label.setText(summary)
+        self._set_actions_enabled(video_loaded=True, project_loaded=True)
+        self._refresh_graph()  # まずフレーム単体の指標(ブレ等)だけ即座に表示
+
+        if self.store.frames:
+            self.current_filename = self.store.frames[-1].filename
+            self._refresh_image_compare()
+
+        self._recompute_edges_async(affected_edges, progress_title="エッジ指標を計算中...")
+
+    def _save_sample_as_frame_record(self, images_dir: Path, sample) -> FrameRecord:
+        record = FrameRecord.create(sample.frame_index, sample.timestamp_ms)
+        record.blur_score = metrics_mod.blur_score(sample.image)
+        record.exposure_ratio = metrics_mod.exposure_ratio(sample.image)
+        cv2.imwrite(str(images_dir / record.filename), sample.image)
+        return record
+
+    def _extract_by_fps(self, images_dir: Path, fps: float) -> list[FrameRecord]:
         frame_records = []
         total_samples = self.reader.estimate_extract_count(fps)
 
@@ -286,25 +332,137 @@ class MainWindow(QMainWindow):
         for i, sample in enumerate(self.reader.extract_at_fps(fps)):
             if progress.wasCanceled():
                 break
-            record = FrameRecord.create(sample.frame_index, sample.timestamp_ms)
-            record.blur_score = metrics_mod.blur_score(sample.image)
-            record.exposure_ratio = metrics_mod.exposure_ratio(sample.image)
-            cv2.imwrite(str(images_dir / record.filename), sample.image)
-            frame_records.append(record)
+            frame_records.append(self._save_sample_as_frame_record(images_dir, sample))
             progress.setValue(i + 1)
 
         progress.close()
+        return frame_records
 
-        affected_edges = self.store.initial_extract(frame_records)
-        self.status_label.setText(f"{len(frame_records)}枚を抽出しました ({fps} fps)")
-        self._set_actions_enabled(video_loaded=True, project_loaded=True)
-        self._refresh_graph()  # まずフレーム単体の指標(ブレ等)だけ即座に表示
+    def _compute_extraction_metrics(self, img1, img2) -> tuple[Optional[float], Optional[float]]:
+        """指標ベース抽出で使うIoU/Coverageを計算する。
 
-        if self.store.frames:
-            self.current_filename = self.store.frames[-1].filename
-            self._refresh_image_compare()
+        IoUは常にORB(「Target ORB Homography IoU」の名の通り、グラフの
+        orb_homography_iouと同じ検出器)。Coverageはグラフのfeature_coverageと
+        一貫した値になるよう、SuperPoint+LightGlueが使えればそれを使う
+        (compute_edge_metrics()と同じ経路を通すことで、グラフに表示される値と
+        完全に同じ計算になる)。未インストール等で使えない場合はORBに自動フォールバックする
+        (初回のみ警告を表示)。
+        """
+        if self.use_sp_lg:
+            try:
+                result = metrics_mod.compute_edge_metrics(img1, img2, K=None, use_superpoint_lightglue=True)
+                return result["orb_homography_iou"], result["feature_coverage"]
+            except ImportError as e:
+                self.use_sp_lg = False
+                if not self._sp_lg_fallback_warned:
+                    self._sp_lg_fallback_warned = True
+                    QMessageBox.warning(
+                        self, "SuperPoint+LightGlue利用不可",
+                        f"SuperPoint+LightGlueが使用できないため、以後ORBで計算します。\n詳細: {e}",
+                    )
+        result = metrics_mod.compute_edge_metrics(img1, img2, K=None, use_superpoint_lightglue=False)
+        return result["orb_homography_iou"], result["feature_coverage"]
 
-        self._recompute_edges_async(affected_edges, progress_title="エッジ指標を計算中...")
+    def _extract_by_metrics(
+        self, images_dir: Path, target_iou: float, target_coverage: float, min_gap: int, max_gap: int
+    ) -> list[FrameRecord]:
+        """直近保存フレームからORB Homography IoU / Feature Coverageのどちらかが
+        目標値を下回る直前のフレームを、Min/Max Frame Gapの範囲内で保存していく。
+
+        1フレームずつ評価すると低速なため、以下の2段階の適応的な幅探索で
+        評価回数を大幅に減らしている(動画全体を舐めるO(フレーム数)ではなく、
+        1回の保存あたりおおむねO(log(max_gap))回の評価で済む)。
+
+        Phase 1 (指数拡大): floor(=直近保存+min_gap)から、直前2回分の移動幅の和
+            (フィボナッチ的に成長する幅: 例 g,g,2g,3g,5g,8g,...)だけ前進し続ける。
+            条件を満たしている間はどんどん幅を広げて先へ進み、満たさなくなった
+            時点で「満たす最後の位置」と「満たさない位置」の区間を特定する。
+        Phase 2 (二分探索での絞り込み): Phase 1で特定した区間内を、幅を半分ずつ
+            狭めながら評価し、「条件を満たす最後のフレーム」を正確に特定する。
+
+        いずれのフェーズもMin/Max Frame Gapの範囲(floor〜ceil)内に収まるようclampする。
+        """
+        frame_records = []
+
+        first_sample = self.reader.get_frame(0)
+        frame_records.append(self._save_sample_as_frame_record(images_dir, first_sample))
+        last_saved_sample = first_sample
+        last_saved_index = 0
+
+        total_frames = self.reader.frame_count
+        progress = QProgressDialog("指標に基づいて抽出中...", "キャンセル", 0, total_frames, self)
+        progress.setWindowModality(Qt.WindowModality.WindowModal)
+
+        def evaluate(sample, phase: str) -> bool:
+            iou, coverage = self._compute_extraction_metrics(last_saved_sample.image, sample.image)
+            ok = (iou is not None and iou >= target_iou) and (coverage is not None and coverage >= target_coverage)
+            if DEBUG_EXTRACT:
+                iou_text = "None(計算不可)" if iou is None else f"{iou:.4f}"
+                cov_text = "None(計算不可)" if coverage is None else f"{coverage:.4f}"
+                print(
+                    f"[extract_by_metrics:{phase}] last_saved_frame={last_saved_sample.frame_index} "
+                    f"candidate_frame={sample.frame_index} gap={sample.frame_index - last_saved_index} "
+                    f"iou={iou_text}(target={target_iou}) coverage={cov_text}(target={target_coverage}) ok={ok}",
+                    flush=True,
+                )
+            return ok
+
+        while last_saved_index < total_frames - 1:
+            if progress.wasCanceled():
+                break
+
+            floor_index = min(last_saved_index + min_gap, total_frames - 1)
+            ceil_index = min(last_saved_index + max_gap, total_frames - 1)
+
+            floor_sample = self.reader.get_frame(floor_index)
+            chosen_sample = floor_sample  # 少なくともfloor_indexは候補になりうる
+
+            if floor_index < ceil_index and evaluate(floor_sample, "floor(min_gap)"):
+                # --- Phase 1: 指数拡大 ---
+                last_ok_index, last_ok_sample = floor_index, floor_sample
+                step_prev_prev, step_prev = 0, max(1, min_gap)
+                pos = floor_index
+                failed_index: Optional[int] = None
+                failed_sample = None
+
+                while True:
+                    step = step_prev + step_prev_prev
+                    next_index = min(pos + step, ceil_index)
+                    if next_index == pos:
+                        break  # ceilに到達済みでこれ以上進めない
+                    next_sample = self.reader.get_frame(next_index)
+                    if evaluate(next_sample, "expand"):
+                        last_ok_index, last_ok_sample = next_index, next_sample
+                        step_prev_prev, step_prev = step_prev, step
+                        pos = next_index
+                        if pos >= ceil_index:
+                            break
+                    else:
+                        failed_index, failed_sample = next_index, next_sample
+                        break
+
+                if failed_index is not None:
+                    # --- Phase 2: 二分探索で境界を絞り込む ---
+                    lo, lo_sample = last_ok_index, last_ok_sample
+                    hi = failed_index
+                    while hi - lo > 1:
+                        mid = (lo + hi) // 2
+                        mid_sample = self.reader.get_frame(mid)
+                        if evaluate(mid_sample, "narrow"):
+                            lo, lo_sample = mid, mid_sample
+                        else:
+                            hi = mid
+                    chosen_sample = lo_sample
+                else:
+                    chosen_sample = last_ok_sample  # ceilまで条件を満たし続けた
+
+            frame_records.append(self._save_sample_as_frame_record(images_dir, chosen_sample))
+            last_saved_sample = chosen_sample
+            last_saved_index = chosen_sample.frame_index
+            progress.setValue(last_saved_index)
+
+        progress.close()
+        return frame_records
 
     # -----------------------------------------------------------------
     # エッジ指標の(再)計算 (バックグラウンドスレッドで実行し、GUIをブロックしない)
